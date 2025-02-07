@@ -65,6 +65,7 @@ class UserData(BaseModel):
 class ChatResponse(BaseModel):
     response: str
     recommended_college_majors: Optional[List[str]] = None  # New field added
+    chatbot_completed: bool = False  # ADDED: Include chatbot status
 
 # --- Request Model ---
 
@@ -179,6 +180,7 @@ class ChatState:
             ("financial_budget", "financial.budget", "ما هي ميزانيتك التقريبية؟"),
         ]
         self.current_step = 0
+        self.chatbot_completed = False  # ADDED: Track chatbot completion
 
     def handle_message(self, message: str) -> str:
         self.conversation_history.append(f"المستخدم: {message}")
@@ -210,6 +212,7 @@ class ChatState:
                 else:
                     recommended_majors = generate_recommended_college_majors(self.user_data)
                     self.user_data.recommended_college_majors = recommended_majors
+                    self.chatbot_completed = True # ADDED: Mark as completed
                     response = (
                         "شكرًا لك على تزويدنا بالمعلومات. إليك قائمة التخصصات الجامعية الموصى بها لك:\n\n" +
                         "\n".join([f"{i+1}. {major}" for i, major in enumerate(recommended_majors)])
@@ -276,6 +279,7 @@ async def chat_endpoint(request: Request, response: Response, chat_request: Chat
     chat_state = chat_sessions[session_id]
     res_message = chat_state.handle_message(chat_request.message)
     recommended_majors = chat_state.user_data.recommended_college_majors
+    chatbot_completed = chat_state.chatbot_completed # Get completion status
 
     if chat_state.current_step < len(chat_state.flow_steps):
         current_question = chat_state.flow_steps[chat_state.current_step][2]
@@ -288,17 +292,30 @@ async def chat_endpoint(request: Request, response: Response, chat_request: Chat
         "last_user_message": chat_request.message,
         "last_ai_response": res_message,
         "current_question": current_question,
+        "chatbot_completed": chatbot_completed, # Include in session info
     }
 
     # Set the cookie with a defined path and max_age.
-    response.set_cookie(
-        "chat_session",
-        json.dumps(session_info),
-        httponly=True,
-        max_age=3600,
-        path="/"
-    )
-    return ChatResponse(response=res_message, recommended_college_majors=recommended_majors)
+    # Conditionally set max_age to 0 if chatbot is completed.
+    if chatbot_completed:
+        response.set_cookie(
+            "chat_session",
+            json.dumps(session_info),
+            httponly=True,
+            max_age=0,  # Expire immediately
+            path="/"
+        )
+    else:
+        response.set_cookie(
+            "chat_session",
+            json.dumps(session_info),
+            httponly=True,
+            max_age=3600,
+            path="/"
+        )
+
+    # Return chatbot_completed status
+    return ChatResponse(response=res_message, recommended_college_majors=recommended_majors, chatbot_completed=chatbot_completed)
 
 @app.get("/data/", response_model=UserData)
 async def get_user_data(request: Request):
