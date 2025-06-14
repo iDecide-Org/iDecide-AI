@@ -4,83 +4,187 @@ import json
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Any
 import google.generativeai as genai
 import os
 import logging
+import joblib
+import numpy as np
+import pandas as pd
+from scipy.spatial.distance import cosine # Added for similarity calculation
+from sklearn.preprocessing import StandardScaler # Added import for StandardScaler
 
 app = FastAPI()
 
-# IMPORTANT: Set allow_credentials to True so that cookies can be set!
-origins = [
-    "http://localhost:5173",  # React frontend URL
-    # Add other origins if necessary
-]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,  # <-- Enable cookies!
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# --- Global Variables for Model and Scaler ---
+MODEL_PROFILES: Optional[pd.DataFrame] = None # Will hold the major profiles DataFrame
+SCALER: Optional[StandardScaler] = None # type: ignore
+MAJOR_NAMES: Optional[List[str]] = [] # List of major names
 
 # --- Configure Logging ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Securely Load API Key ---
-genai.configure(api_key="AIzaSyAs7X_8HaTKP44Y5YCRN2Nbnx58Yb59zQk")
-model = genai.GenerativeModel('gemini-2.0-flash-exp')
+# --- Securely Load API Key & Configure Gemini ---
+# IMPORTANT: Consider moving the API key to an environment variable for security
+try:
+    gemini_api_key = os.getenv("GEMINI_API_KEY", "AIzaSyAs7X_8HaTKP44Y5YCRN2Nbnx58Yb59zQk") # Fallback to hardcoded if not in env
+    if gemini_api_key == "AIzaSyAs7X_8HaTKP44Y5YCRN2Nbnx58Yb59zQk":
+        logger.warning("Using a hardcoded API key for Gemini. Consider setting GEMINI_API_KEY environment variable.")
+    genai.configure(api_key=gemini_api_key)
+    gemini_model = genai.GenerativeModel('gemini-1.5-flash') # Updated model name
+except Exception as e:
+    logger.error(f"Failed to configure Gemini API: {e}")
+    gemini_model = None
+
+# --- CORS Configuration ---
+origins = [
+    "http://localhost:5173",  # React frontend URL
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- Load Model and Scaler at Startup ---
+@app.on_event("startup")
+async def load_model_resources():
+    global MODEL_PROFILES, SCALER, MAJOR_NAMES
+    try:
+        profiles_path = os.path.join("model", "major_profiles.joblib")
+        scaler_path = os.path.join("model", "major_scaler.joblib")
+        csv_path = os.path.join("model", "cleaned_riasec_big5_major.csv")
+
+        if not os.path.exists(profiles_path):
+            logger.error(f"Major profiles file not found at {profiles_path}")
+            raise FileNotFoundError(f"Major profiles file not found at {profiles_path}")
+        if not os.path.exists(scaler_path):
+            logger.error(f"Scaler file not found at {scaler_path}")
+            raise FileNotFoundError(f"Scaler file not found at {scaler_path}")
+
+        MODEL_PROFILES = joblib.load(profiles_path)
+        SCALER = joblib.load(scaler_path)
+        logger.info("Major profiles (DataFrame) and Scaler loaded successfully.")
+
+        if not isinstance(MODEL_PROFILES, pd.DataFrame):
+            logger.error(f"Loaded major profiles is not a pandas DataFrame. Type: {type(MODEL_PROFILES)}")
+            MODEL_PROFILES = None # Invalidate if not a DataFrame
+            raise TypeError("Loaded major_profiles.joblib is not a DataFrame.")
+        
+        logger.info(f"Type of loaded SCALER: {type(SCALER)}")
+        if not hasattr(SCALER, 'transform') or not hasattr(SCALER, 'feature_names_in_'):
+             logger.error(f"Loaded scaler does not appear to be a valid scikit-learn scaler. Type: {type(SCALER)}")
+             SCALER = None # Invalidate
+             raise TypeError("Loaded major_scaler.joblib is not a valid scaler.")
+
+
+        # --- Determine MAJOR_NAMES ---
+        MAJOR_NAMES = []
+        major_names_populated = False
+
+        if MODEL_PROFILES is not None and not MODEL_PROFILES.empty and MODEL_PROFILES.index.name is not None and len(MODEL_PROFILES.index) > 0:
+            try:
+                temp_list_from_index = [str(s).strip() for s in MODEL_PROFILES.index.tolist() if s is not None and str(s).strip()]
+                if temp_list_from_index:
+                    MAJOR_NAMES = sorted(list(set(temp_list_from_index)))
+                    if MAJOR_NAMES:
+                        logger.info(f"Loaded {len(MAJOR_NAMES)} unique major names from DataFrame index.")
+                        major_names_populated = True
+                    else:
+                        logger.info("DataFrame index found but was empty or yielded no valid major names.")
+                else:
+                    logger.info("DataFrame index found but was empty or yielded no valid major names.")
+            except Exception as e:
+                logger.error(f"Error processing DataFrame index for major names: {e}. Will attempt CSV fallback.")
+        
+        if not major_names_populated:
+            logger.warning("Could not populate major names from DataFrame index. Attempting CSV fallback.")
+            if os.path.exists(csv_path):
+                logger.info(f"Attempting to load major names from CSV: {csv_path}.")
+                try:
+                    df_csv = pd.read_csv(csv_path)
+                    major_column_name = 'major' # As corrected previously
+                    if major_column_name in df_csv.columns:
+                        csv_majors = [str(s).strip() for s in df_csv[major_column_name].astype(str).unique().tolist() if s is not None and str(s).strip()]
+                        if csv_majors:
+                            MAJOR_NAMES = sorted(list(set(csv_majors)))
+                            logger.info(f"Successfully loaded {len(MAJOR_NAMES)} unique major names from CSV column '{major_column_name}'.")
+                            major_names_populated = True
+                        else:
+                            logger.warning(f"CSV column '{major_column_name}' found but contained no valid major names.")
+                    else:
+                        logger.error(f"Column '{major_column_name}' not found in {csv_path}. Available columns: {df_csv.columns.tolist()}")
+                except Exception as e:
+                    logger.error(f"Error loading major names from CSV {csv_path}: {e}")
+            else:
+                logger.info(f"CSV file for major names not found at {csv_path}.")
+
+        if not MAJOR_NAMES:
+             logger.critical("MAJOR_NAMES is empty after all attempts. Application will not be able to provide major recommendations.")
+             # raise RuntimeError("Failed to load major names. Application cannot start.")
+        else:
+            logger.info(f"Final MAJOR_NAMES count: {len(MAJOR_NAMES)}")
+
+
+    except FileNotFoundError as fnf_error:
+        logger.critical(f"Essential model resource file not found: {fnf_error}")
+        MODEL_PROFILES = None
+        SCALER = None
+        MAJOR_NAMES = []
+    except TypeError as type_error:
+        logger.critical(f"Type error with loaded model resources: {type_error}")
+        MODEL_PROFILES = None
+        SCALER = None
+        MAJOR_NAMES = []
+    except Exception as e:
+        logger.critical(f"An unexpected error occurred during model resource loading: {e}")
+        MODEL_PROFILES = None
+        SCALER = None
+        MAJOR_NAMES = []
 
 # --- Data Models ---
+class RIASECInput(BaseModel):
+    realistic: Optional[float] = None
+    investigative: Optional[float] = None
+    artistic: Optional[float] = None
+    social: Optional[float] = None
+    enterprising: Optional[float] = None
+    conventional: Optional[float] = None
 
-class UserPersonal(BaseModel):
-    full_name: Optional[str] = None
-    age: Optional[int] = None
-    location: Optional[str] = None
-    interests: Optional[List[str]] = None
-
-class UserAcademic(BaseModel):
-    education_level: Optional[str] = None
-    major: Optional[str] = None
-    grade: Optional[float] = None
-    skills: Optional[List[str]] = None
-
-class UserCareer(BaseModel):
-    career_goals: Optional[str] = None
-    preferred_industry: Optional[str] = None
-    desired_salary: Optional[str] = None
-
-class UserFinancial(BaseModel):
-    budget: Optional[str] = None
+class BIG5Input(BaseModel):
+    openness: Optional[float] = None
+    conscientiousness: Optional[float] = None
+    extraversion: Optional[float] = None
+    agreeableness: Optional[float] = None
+    emotional_stability: Optional[float] = None # Changed from neuroticism
 
 class UserData(BaseModel):
-    personal: UserPersonal = UserPersonal()
-    academic: UserAcademic = UserAcademic()
-    career: UserCareer = UserCareer()
-    financial: UserFinancial = UserFinancial()
-    recommended_college_majors: Optional[List[str]] = None  # New field added
+    riasec: RIASECInput = RIASECInput()
+    big5: BIG5Input = BIG5Input()
+    recommended_college_majors: Optional[List[str]] = None
 
 class ChatResponse(BaseModel):
     response: str
-    recommended_college_majors: Optional[List[str]] = None  # New field added
-    chatbot_completed: bool = False  # ADDED: Include chatbot status
-
-# --- Request Model ---
+    recommended_college_majors: Optional[List[str]] = None
+    chatbot_completed: bool = False
 
 class ChatRequest(BaseModel):
     message: str
 
 # --- Helper Functions ---
-
-def generate_gemini_response(prompt: str, history: Optional[List[str]] = None) -> str:
-    """Generates a response using the Gemini Pro model."""
+def generate_gemini_response(prompt: str) -> str:
+    """Generates a response using the Gemini model."""
+    if not gemini_model:
+        logger.error("Gemini model not available for generating response.")
+        return "عذرًا، خدمة الذكاء الاصطناعي غير متاحة حاليًا."
     try:
-        response = model.generate_content(
+        response = gemini_model.generate_content(
             prompt,
-            generation_config=genai.types.GenerationConfig(candidate_count=1),
-            safety_settings=None,
+            generation_config=genai.types.GenerationConfig(candidate_count=1), # type: ignore
+            # safety_settings=None, # Consider configuring safety settings
             stream=False
         )
         return response.text.strip()
@@ -89,7 +193,7 @@ def generate_gemini_response(prompt: str, history: Optional[List[str]] = None) -
         return "عذرًا، حدث خطأ أثناء معالجة طلبك. يرجى المحاولة لاحقًا."
 
 def is_user_question(message: str) -> bool:
-    """Determines if the user's message is a question."""
+    """Determines if the user's message is a question using Gemini."""
     question_prompt = f"""
     باللغة العربية، حدد ما إذا كانت الرسالة التالية سؤالاً أم لا.
     الرسالة: "{message}"
@@ -98,170 +202,207 @@ def is_user_question(message: str) -> bool:
     response = generate_gemini_response(question_prompt)
     return 'نعم' in response.lower()
 
-def validate_input_with_ai(user_input: str, context: str) -> (bool, Optional[str]):
-    """
-    Uses AI to validate user input and provides feedback.  Improved feedback extraction.
-    """
-    validation_prompt = f"""
-    باللغة العربية، قم بتقييم ما إذا كان إدخال المستخدم التالي منطقيًا وذو صلة بالسياق الموضح أدناه.
-    السياق: {context}
-    إدخال المستخدم: {user_input}
-    قيم الإدخال بـ "نعم" إذا كان مناسبًا، أو "لا" متبوعًا بتفسير قصير إذا كان غير مناسب.
-    """
-    response = generate_gemini_response(validation_prompt)
-    if 'نعم' in response.lower():
-        return True, None
-    else:
-        # Find the index of "لا"
-        no_index = response.lower().find('لا')
-        if no_index != -1:
-            # Find the start of the explanation (after "لا")
-            # Look for the first letter, number, or common punctuation mark
-            match = re.search(r"[\u0600-\u06FF\d،؛؟!. ]", response[no_index + len('لا'):]) #Arabic letters, digits and punctuations
-            if match:
-                start_index = no_index + len('لا') + match.start()
-                feedback = response[start_index:].strip()
-                return False, feedback or "الإدخال غير صالح. يرجى المحاولة مرة أخرى."
+def predict_majors_from_model(user_data: UserData, top_n: int = 5) -> List[str]:
+    """Generates a list of recommended college majors using cosine similarity with major profiles."""
+    if MODEL_PROFILES is None or SCALER is None or not MAJOR_NAMES:
+        logger.error("Model profiles, Scaler, or MAJOR_NAMES not loaded. Cannot predict majors.")
+        return ["تعذر التنبؤ بالتخصصات بسبب عدم توفر النموذج أو بيانات التخصصات."]
 
-        # Fallback if "لا" is not found or parsing fails
-        return False, "الإدخال غير صالح. يرجى المحاولة مرة أخرى."
+    try:
+        # Define the feature order based on train.py
+        # ['realistic', 'investigative', 'artistic', 'social', 'enterprising', 'conventional',
+        #  'extraversion', 'agreeableness', 'conscientiousness', 'emotional_stability', 'openness']
+        
+        user_scores_map = {
+            'realistic': user_data.riasec.realistic,
+            'investigative': user_data.riasec.investigative,
+            'artistic': user_data.riasec.artistic,
+            'social': user_data.riasec.social,
+            'enterprising': user_data.riasec.enterprising,
+            'conventional': user_data.riasec.conventional,
+            'extraversion': user_data.big5.extraversion,
+            'agreeableness': user_data.big5.agreeableness,
+            'conscientiousness': user_data.big5.conscientiousness,
+            'emotional_stability': user_data.big5.emotional_stability, # Matched to train.py
+            'openness': user_data.big5.openness
+        }
 
-def generate_recommended_college_majors(user_data: UserData) -> List[str]:
-    """Generates a list of recommended college majors based on collected user data."""
-    prompt = f"""
-    بناءً على المعلومات التالية للمستخدم، قم بإنشاء قائمة من التخصصات الجامعية الموصى بها باللغة العربية.
-    البيانات الشخصية: {user_data.personal.json()}
-    البيانات الأكاديمية: {user_data.academic.json()}
-    البيانات المهنية: {user_data.career.json()}
-    البيانات المالية: {user_data.financial.json()}
+        # Ensure all data is present
+        if any(score is None for score in user_scores_map.values()):
+            logger.warning("Not all RIASEC/BIG5 scores are available for prediction.")
+            return ["يرجى إكمال جميع مدخلات RIASEC و BIG5 أولاً."]
 
-    قائمة التخصصات الموصى بها:
-    1.
-    """
-    response = generate_gemini_response(prompt)
-    
-    # Attempt to parse the response into a list of majors
-    majors = []
-    for line in response.split('\n'):
-        if line.strip().startswith(tuple(str(i) for i in range(1, 100))):
-            # Remove the numbering (e.g., "1. Computer Science" -> "Computer Science")
-            major = line.split('.', 1)[-1].strip()
-            if major:
-                majors.append(major)
-    if not majors:
-        majors = [line.strip() for line in response.split('\n') if line.strip()]
-    return majors[:5]  # Limit to top 5 recommendations
+        # Get feature names from the scaler to ensure correct order
+        # This makes it robust if SCALER.feature_names_in_ is available and matches
+        try:
+            model_feature_names = SCALER.feature_names_in_
+        except AttributeError:
+            logger.error("SCALER does not have 'feature_names_in_'. Falling back to predefined order. This might be risky.")
+            # Fallback to the order explicitly defined, hoping it matches the scaler's training
+            model_feature_names = [
+                'realistic', 'investigative', 'artistic', 'social', 'enterprising', 'conventional',
+                'extraversion', 'agreeableness', 'conscientiousness', 'emotional_stability', 'openness'
+            ]
+
+
+        # Construct the feature vector in the order defined by model_feature_names
+        features_vector = [user_scores_map[name] for name in model_feature_names]
+        
+        # Check if all features required by the scaler are present in user_scores_map
+        # This is an additional safety check
+        for feature_name in model_feature_names:
+            if feature_name not in user_scores_map or user_scores_map[feature_name] is None:
+                logger.error(f"Missing score for feature '{feature_name}' required by the model/scaler.")
+                return [f"يرجى تقديم قيمة لـ '{feature_name}'."]
+
+
+        user_features_array = np.array([features_vector])
+        
+        # Scale the user's features
+        user_scaled_features = SCALER.transform(user_features_array)
+
+        recommendations = {}
+        # MODEL_PROFILES is the DataFrame of major_category -> feature_means
+        for major_category, profile_vector in MODEL_PROFILES.iterrows():
+            # Ensure profile_vector is also in the same order as user_scaled_features
+            # If MODEL_PROFILES columns are already ordered correctly (matching scaler.feature_names_in_)
+            # then profile_vector.values should be fine.
+            # For safety, reorder profile_vector if its columns might not match scaler.feature_names_in_
+            # However, MODEL_PROFILES was created using 'features' list in train.py, which should match.
+            
+            # Check if profile_vector needs reordering based on scaler's feature names
+            # This is an extra safety, assuming MODEL_PROFILES.columns are the feature names
+            ordered_profile_values = profile_vector[model_feature_names].values
+            
+            similarity = 1 - cosine(user_scaled_features[0], ordered_profile_values)
+            recommendations[str(major_category)] = similarity # Ensure major_category is string
+
+        # Sort recommendations by similarity score in descending order
+        sorted_recs = sorted(recommendations.items(), key=lambda item: item[1], reverse=True)
+        
+        recommended_majors = [major for major, score in sorted_recs[:top_n] if score > 0] # Optionally filter by min score
+
+        return recommended_majors if recommended_majors else ["لم يتم العثور على تخصصات موصى بها بناءً على مدخلاتك."]
+
+    except Exception as e:
+        logger.error(f"Error during major prediction using cosine similarity: {e}", exc_info=True)
+        return [f"حدث خطأ أثناء التنبؤ بالتخصصات: {e}"]
 
 # --- Chatbot Logic ---
-
 class ChatState:
     def __init__(self):
         self.user_data = UserData()
         self.conversation_history = []
         self.faq_answers = {
-            "ما هي الخدمات التي نقدمها؟": "نحن هنا لمساعدتك في جمع معلوماتك وتوفير توصيات مخصصة لك.",
+            "ما هي الخدمات التي نقدمها؟": "نحن هنا لمساعدتك في تحديد التخصصات الجامعية المناسبة بناءً على تقييمات RIASEC و BIG5.",
             "كيف يمكنني التواصل معكم؟": "يمكنك التواصل معنا من خلال هذه المحادثة.",
             "هل معلوماتي آمنة معكم؟": "نحن نولي أهمية كبيرة لخصوصية معلوماتك.",
-            # Add more FAQs if needed
         }
-        self.current_question_type = None  # To track which data is being collected
         self.flow_steps = [
-            ("personal_name", "personal.full_name", "أهلاً بك! ما هو اسمك الكامل؟"),
-            ("personal_age", "personal.age", "ما هو عمرك؟"),
-            ("personal_location", "personal.location", "أين تقيم؟"),
-            ("personal_interests", "personal.interests", "ما هي بعض اهتماماتك؟"),
-            ("academic_level", "academic.education_level", "ما هو أعلى مستوى تعليمي حصلت عليه؟ (مثال: الثانوية العامة, الشهادة الجامعية, تعليم فني)"),
-            ("academic_major", "academic.major", "ما هو تخصصك الدراسي؟ (مثال: علمي علوم, علمي رياضة, أدبي)"),
-            ("academic_grade", "academic.grade", "ما هو مجموعك الدراسي؟ (مثال: 50 - 100)"),
-            ("academic_skills", "academic.skills", "ما هي بعض مهاراتك؟"),
-            ("career_goals", "career.career_goals", "ما هي أهدافك المهنية؟"),
-            ("career_industry", "career.preferred_industry", "ما هو القطاع الصناعي الذي تفضله؟"),
-            ("career_salary", "career.desired_salary", "ما هو الراتب الذي تطمح إليه؟"),
-            ("financial_budget", "financial.budget", "ما هي ميزانيتك التقريبية؟"),
+            ("riasec_r", "riasec.realistic", "ما هي درجة واقعيتك (Realistic)؟ (أدخل قيمة رقمية، مثال: 3.5)", "numeric"),
+            ("riasec_i", "riasec.investigative", "ما هي درجة بحثك (Investigative)؟ (أدخل قيمة رقمية)", "numeric"),
+            ("riasec_a", "riasec.artistic", "ما هي درجة حسك الفني (Artistic)؟ (أدخل قيمة رقمية)", "numeric"),
+            ("riasec_s", "riasec.social", "ما هي درجة اجتماعيتك (Social)؟ (أدخل قيمة رقمية)", "numeric"),
+            ("riasec_e", "riasec.enterprising", "ما هي درجة إقدامك (Enterprising)؟ (أدخل قيمة رقمية)", "numeric"),
+            ("riasec_c", "riasec.conventional", "ما هي درجة تقليديتك (Conventional)؟ (أدخل قيمة رقمية)", "numeric"),
+            ("big5_o", "big5.openness", "ما هي درجة انفتاحك على التجارب (Openness)؟ (أدخل قيمة رقمية)", "numeric"),
+            ("big5_c", "big5.conscientiousness", "ما هي درجة ضميرك الحي (Conscientiousness)؟ (أدخل قيمة رقمية)", "numeric"),
+            ("big5_e", "big5.extraversion", "ما هي درجة انبساطك (Extraversion)؟ (أدخل قيمة رقمية)", "numeric"),
+            ("big5_a", "big5.agreeableness", "ما هي درجة مقبوليتك (Agreeableness)؟ (أدخل قيمة رقمية)", "numeric"),
+            ("big5_es", "big5.emotional_stability", "ما هي درجة استقرارك العاطفي (Emotional Stability)؟ (أدخل قيمة رقمية)", "numeric"), # Changed
         ]
         self.current_step = 0
-        self.chatbot_completed = False  # ADDED: Track chatbot completion
+        self.chatbot_completed = False
 
     def handle_message(self, message: str) -> str:
         self.conversation_history.append(f"المستخدم: {message}")
-        if self.current_step < len(self.flow_steps):
-            step_key, field_path, prompt = self.flow_steps[self.current_step]
-            context = f"السؤال عن {prompt}"
-            final_field = field_path.split('.')[-1]
 
-            # Validate numeric fields manually.
-            if final_field in ("age", "grade"):
-                try:
-                    if final_field == "age":
-                        int(message)
-                    else:
-                        float(message)
-                    is_valid = True
-                    feedback = None
-                except ValueError:
-                    is_valid = False
-                    feedback = "يرجى إدخال رقم صالح."
-            else:
-                is_valid, feedback = validate_input_with_ai(message, context)
-
-            if is_valid:
-                self.set_user_data(field_path, message)
-                self.current_step += 1
-                if self.current_step < len(self.flow_steps):
-                    response = self.flow_steps[self.current_step][2]
-                else:
-                    recommended_majors = generate_recommended_college_majors(self.user_data)
-                    self.user_data.recommended_college_majors = recommended_majors
-                    self.chatbot_completed = True # ADDED: Mark as completed
-                    response = (
-                        "شكرًا لك على تزويدنا بالمعلومات. إليك قائمة التخصصات الجامعية الموصى بها لك:\n\n" +
-                        "\n".join([f"{i+1}. {major}" for i, major in enumerate(recommended_majors)])
-                    )
-            else:
-                response = feedback or "لم أفهم ذلك. هل يمكنك إعادة المحاولة؟"
-
+        if MODEL_PROFILES is None or SCALER is None or not MAJOR_NAMES:
+            response = "عذرًا، نظام التوصية غير جاهز حاليًا بسبب مشكلة في تحميل الموارد الأساسية. يرجى المحاولة لاحقًا أو الاتصال بالدعم."
             self.conversation_history.append(f"الرد الآلي: {response}")
+            self.chatbot_completed = True 
+            self.user_data.recommended_college_majors = []
             return response
 
-        if is_user_question(message):
-            answer = generate_gemini_response(f"أجب على السؤال التالي باللغة العربية: {message}")
-            reminder = "هل تحتاج إلى مساعدة إضافية؟ يرجى الاستمرار في تزويدنا بمعلوماتك."
-            full_response = f"{answer}\n\n{reminder}"
-            self.conversation_history.append(f"الرد الآلي: {full_response}")
-            return full_response
+        if self.current_step < len(self.flow_steps):
+            step_key, field_path, prompt_question, input_type = self.flow_steps[self.current_step]
+            
+            is_valid = False
+            feedback = None
+            processed_value = None
 
-        for question, answer in self.faq_answers.items():
-            if question in message:
-                self.conversation_history.append(f"الرد الآلي: {answer}")
-                return answer
+            if input_type == "numeric":
+                try:
+                    processed_value = float(message)
+                    is_valid = True
+                except ValueError:
+                    is_valid = False
+                    feedback = "يرجى إدخال قيمة رقمية صالحة."
+            else: 
+                is_valid = True 
+                processed_value = message
 
-        response = "شكرًا لك على تزويدنا بالمعلومات."
+            if is_valid:
+                self.set_user_data(field_path, processed_value)
+                self.current_step += 1
+                if self.current_step < len(self.flow_steps):
+                    response = self.flow_steps[self.current_step][2] 
+                else:
+                    recommended_majors = predict_majors_from_model(self.user_data)
+                    self.user_data.recommended_college_majors = recommended_majors
+                    self.chatbot_completed = True
+                    if recommended_majors and "تعذر" not in recommended_majors[0] and "يرجى إكمال" not in recommended_majors[0]:
+                        response = (
+                            "شكرًا لك على تزويدنا بالمعلومات. بناءً على إجاباتك، إليك قائمة التخصصات الجامعية الموصى بها لك:\\n\\n" +
+                            "\\n".join([f"- {major}" for major in recommended_majors]) +
+                            "\\n\\nهل لديك أي أسئلة أخرى؟"
+                        )
+                    else:
+                         response = (
+                            "شكرًا لك على تزويدنا بالمعلومات.\\n" +
+                            (recommended_majors[0] if recommended_majors else "لم نتمكن من تحديد توصيات في الوقت الحالي.") +
+                            "\\n\\nهل لديك أي أسئلة أخرى؟"
+                        )
+            else:
+                response = feedback or "لم أفهم ذلك. هل يمكنك إعادة المحاولة؟"
+        
+        else: 
+            if is_user_question(message):
+                answer = generate_gemini_response(f"أجب على السؤال التالي باللغة العربية مع الأخذ في الاعتبار أن المستخدم قد أكمل للتو استبيان RIASEC/BIG5 للتوصية بالتخصصات الجامعية: {message}")
+                full_response = f"{answer}"
+                self.conversation_history.append(f"الرد الآلي: {full_response}")
+                return full_response
+
+            for question, answer in self.faq_answers.items():
+                if question in message or message in question: 
+                    self.conversation_history.append(f"الرد الآلي: {answer}")
+                    return answer
+            
+            response = generate_gemini_response(f"المستخدم قال: \"{message}\". قدم ردًا عامًا ومساعدًا باللغة العربية، مع العلم أن المستخدم قد أكمل استبيان التوصية بالتخصصات.")
+
         self.conversation_history.append(f"الرد الآلي: {response}")
         return response
 
-    def set_user_data(self, field_path: str, value: str):
-        fields = field_path.split('.')
-        data = self.user_data
-        for field in fields[:-1]:
-            data = getattr(data, field)
-        final_field = fields[-1]
-        if isinstance(getattr(data, final_field), list):
-            setattr(data, final_field, [item.strip() for item in value.split(',')])
-        elif final_field in ("age", "grade"):
-            try:
-                setattr(data, final_field, int(value) if final_field == "age" else float(value))
-            except ValueError:
-                setattr(data, final_field, None)
+    def set_user_data(self, field_path: str, value: Any):
+        parts = field_path.split('.')
+        obj = self.user_data
+        for part in parts[:-1]:
+            if getattr(obj, part) is None: 
+                if part == "riasec": setattr(obj, part, RIASECInput())
+                elif part == "big5": setattr(obj, part, BIG5Input())
+            obj = getattr(obj, part)
+        
+        if hasattr(obj, parts[-1]):
+            setattr(obj, parts[-1], value)
         else:
-            setattr(data, final_field, value)
+            logger.error(f"Attempted to set non-existent attribute {parts[-1]} on {type(obj)}")
+
 
 # --- Global Chat Sessions ---
-
 chat_sessions: Dict[str, ChatState] = {}
 
 # --- FastAPI Endpoints ---
-
-@app.post("/chat/")  # Keep the trailing slash
+@app.post("/chat/")
 async def chat_endpoint(request: Request, response: Response, chat_request: ChatRequest):
     session_cookie = request.cookies.get("chat_session")
     session_id = None
@@ -270,52 +411,62 @@ async def chat_endpoint(request: Request, response: Response, chat_request: Chat
             session_data = json.loads(session_cookie)
             session_id = session_data.get("id")
         except json.JSONDecodeError:
+            logger.warning("Failed to decode session cookie JSON.")
             session_id = None
 
-    if not session_id or session_id not in chat_sessions:
-        session_id = str(uuid.uuid4())
-        chat_sessions[session_id] = ChatState()
-
-    chat_state = chat_sessions[session_id]
-    res_message = chat_state.handle_message(chat_request.message)
-    recommended_majors = chat_state.user_data.recommended_college_majors
-    chatbot_completed = chat_state.chatbot_completed # Get completion status
-
-    if chat_state.current_step < len(chat_state.flow_steps):
-        current_question = chat_state.flow_steps[chat_state.current_step][2]
+    chat_state: ChatState
+    if session_id and session_id in chat_sessions:
+        chat_state = chat_sessions[session_id]
+        if chat_state.chatbot_completed and (MODEL_PROFILES is None or SCALER is None or not MAJOR_NAMES):
+            logger.warning(f"Session {session_id} was completed, but model resources are now unavailable. Resetting state slightly.")
     else:
-        current_question = None
+        session_id = str(uuid.uuid4())
+        chat_state = ChatState()
+        chat_sessions[session_id] = chat_state
+        if MODEL_PROFILES is not None and SCALER is not None and MAJOR_NAMES and chat_state.current_step < len(chat_state.flow_steps) :
+            initial_response = chat_state.flow_steps[0][2]
+            chat_state.conversation_history.append(f"الرد الآلي: {initial_response}")
+            
+            session_info_new = {
+                "id": session_id,
+                "current_step": chat_state.current_step, 
+                "last_user_message": "", 
+                "last_ai_response": initial_response,
+                "chatbot_completed": chat_state.chatbot_completed,
+            }
+            response.set_cookie(
+                "chat_session", json.dumps(session_info_new),
+                httponly=True, max_age=3600, path="/"
+            )
+            return ChatResponse(
+                response=initial_response,
+                recommended_college_majors=None,
+                chatbot_completed=False
+            )
+
+    res_message = chat_state.handle_message(chat_request.message)
+    
+    recommended_majors = chat_state.user_data.recommended_college_majors
+    chatbot_completed_status = chat_state.chatbot_completed
 
     session_info = {
         "id": session_id,
         "current_step": chat_state.current_step,
         "last_user_message": chat_request.message,
         "last_ai_response": res_message,
-        "current_question": current_question,
-        "chatbot_completed": chatbot_completed, # Include in session info
+        "chatbot_completed": chatbot_completed_status,
     }
 
-    # Set the cookie with a defined path and max_age.
-    # Conditionally set max_age to 0 if chatbot is completed.
-    if chatbot_completed:
-        response.set_cookie(
-            "chat_session",
-            json.dumps(session_info),
-            httponly=True,
-            max_age=0,  # Expire immediately
-            path="/"
-        )
-    else:
-        response.set_cookie(
-            "chat_session",
-            json.dumps(session_info),
-            httponly=True,
-            max_age=3600,
-            path="/"
-        )
+    response.set_cookie(
+        "chat_session", json.dumps(session_info),
+        httponly=True, max_age=3600, path="/" 
+    )
 
-    # Return chatbot_completed status
-    return ChatResponse(response=res_message, recommended_college_majors=recommended_majors, chatbot_completed=chatbot_completed)
+    return ChatResponse(
+        response=res_message,
+        recommended_college_majors=recommended_majors,
+        chatbot_completed=chatbot_completed_status
+    )
 
 @app.get("/data/", response_model=UserData)
 async def get_user_data(request: Request):
@@ -324,8 +475,15 @@ async def get_user_data(request: Request):
         try:
             session_data = json.loads(session_cookie)
             session_id = session_data.get("id")
+            if session_id in chat_sessions:
+                return chat_sessions[session_id].user_data
         except json.JSONDecodeError:
+            logger.warning("Failed to decode session cookie JSON for /data/ endpoint.")
             raise HTTPException(status_code=400, detail="بيانات تعريف الجلسة غير صالحة")
-        if session_id in chat_sessions:
-            return chat_sessions[session_id].user_data
-    raise HTTPException(status_code=404, detail="لم يتم العثور على جلسة مستخدم")
+    raise HTTPException(status_code=404, detail="لم يتم العثور على جلسة مستخدم أو بيانات")
+
+# --- Entry point for running with Uvicorn (optional, for local dev) ---
+if __name__ == "__main__":
+    import uvicorn
+    logger.info("Starting Uvicorn server for local development.")
+    uvicorn.run(app, host="0.0.0.0", port=8000)
